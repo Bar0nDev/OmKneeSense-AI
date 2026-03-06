@@ -1,0 +1,196 @@
+import cv2
+import numpy as np
+from tqdm import tqdm
+from scipy.signal import butter, filtfilt
+
+# ==========================================================
+# USER SETTINGS
+# ==========================================================
+INPUT_VIDEO  = r".\inputVids\vts\raw\vts_input.mp4"
+OUTPUT_VIDEO = r".\inputVids\vts\clean\processed_vts.mp4"
+
+# ---- Preview ----
+PREVIEW_MODE = False
+PREVIEW_FRAMES = 120
+
+# ---- Downscale (CRITICAL for memory safety) ----
+SCALE_FACTOR = 0.5   # 0.5 = 75% less memory, 0.4 = 84% less
+
+# ---- Fisheye ----
+K1 = -0.05
+FX_SCALE = 0.9
+FY_SCALE = 0.9
+
+# ---- Motion Magnification ----
+AMPLIFICATION = 30
+FREQ_MIN = 0.8
+FREQ_MAX = 2.0
+PYRAMID_LEVELS = 4
+
+# ==========================================================
+# LAPLACIAN PYRAMID
+# ==========================================================
+def build_laplacian_pyramid(img, levels):
+    pyramid = []
+    temp = img.copy()
+    for _ in range(levels):
+        down = cv2.pyrDown(temp)
+        up   = cv2.pyrUp(down, dstsize=(temp.shape[1], temp.shape[0]))
+        pyramid.append(cv2.subtract(temp, up))
+        temp = down
+    pyramid.append(temp)
+    return pyramid
+
+def collapse_laplacian_pyramid(pyramid):
+    img = pyramid[-1]
+    for i in range(len(pyramid) - 2, -1, -1):
+        up  = cv2.pyrUp(img, dstsize=(pyramid[i].shape[1], pyramid[i].shape[0]))
+        img = cv2.add(up, pyramid[i])
+    return img
+
+def temporal_bandpass_filter(data, fps, freq_min, freq_max):
+    nyquist = 0.5 * fps
+    low  = max(freq_min / nyquist, 1e-4)
+    high = min(freq_max / nyquist, 1 - 1e-4)
+    b, a = butter(2, [low, high], btype='band')
+    return filtfilt(b, a, data, axis=0)
+
+# ==========================================================
+# FISHEYE
+# ==========================================================
+def build_camera_matrix(w, h):
+    fx = FX_SCALE * w
+    fy = FY_SCALE * h
+    cx = w / 2
+    cy = h / 2
+    K = np.array([[fx, 0, cx],
+                  [0, fy, cy],
+                  [0,  0,  1]], dtype=np.float32)
+    D = np.array([K1, 0, 0, 0], dtype=np.float32)
+    return K, D
+
+def fisheye_correct(frame, K, D):
+    return cv2.undistort(frame, K, D)
+
+# ==========================================================
+# MAIN PIPELINE
+# ==========================================================
+cap = cv2.VideoCapture(INPUT_VIDEO)
+if not cap.isOpened():
+    raise RuntimeError("Cannot open video")
+
+fps    = cap.get(cv2.CAP_PROP_FPS)
+width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+if PREVIEW_MODE:
+    total = min(total, PREVIEW_FRAMES)
+
+# ---- Percentage crop ----
+CROP = {
+    "LEFT":   int(0.23 * width),
+    "RIGHT":  int(0.20 * width),
+    "TOP":    int(0.20 * height),
+    "BOTTOM": int(0.17 * height)
+}
+
+K, D = build_camera_matrix(width, height)
+
+frames_yuv = []
+scaled_w = None
+scaled_h = None
+
+print("▶️ Loading + fisheye + crop + downscale...")
+
+for i in tqdm(range(total)):
+
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # 1️⃣ Fisheye
+    corrected = fisheye_correct(frame, K, D)
+
+    # 2️⃣ Crop
+    cropped = corrected[
+        CROP["TOP"]:height - CROP["BOTTOM"],
+        CROP["LEFT"]:width - CROP["RIGHT"]
+    ]
+
+    # 3️⃣ Downscale (memory saver)
+    cropped = cv2.resize(
+        cropped,
+        (int(cropped.shape[1] * SCALE_FACTOR),
+         int(cropped.shape[0] * SCALE_FACTOR)),
+        interpolation=cv2.INTER_AREA
+    )
+
+    if scaled_w is None:
+        scaled_h, scaled_w = cropped.shape[:2]
+
+    yuv = cv2.cvtColor(cropped, cv2.COLOR_BGR2YUV).astype(np.float32) / 255.0
+    frames_yuv.append(yuv)
+
+cap.release()
+
+print("Building pyramids...")
+
+N = len(frames_yuv)
+pyramid_seq = []
+
+for frame in tqdm(frames_yuv):
+    pyr = build_laplacian_pyramid(frame[:,:,0], PYRAMID_LEVELS)
+    pyramid_seq.append(pyr)
+
+num_levels = len(pyramid_seq[0])
+
+print("Temporal filtering...")
+
+filtered_pyramids = []
+for lv in tqdm(range(num_levels)):
+    seq = np.array([pyramid_seq[t][lv] for t in range(N)], dtype=np.float32)
+    filt = temporal_bandpass_filter(seq, fps, FREQ_MIN, FREQ_MAX)
+    filtered_pyramids.append(filt)
+
+print("Reconstructing...")
+
+out_frames = []
+
+for t in tqdm(range(N)):
+
+    orig_pyr = pyramid_seq[t]
+
+    mag_pyr = []
+    for lv in range(num_levels):
+        mag_pyr.append(
+            orig_pyr[lv] + AMPLIFICATION * filtered_pyramids[lv][t]
+        )
+
+    y_mag = np.clip(collapse_laplacian_pyramid(mag_pyr), 0, 1)
+
+    yuv_mag = np.stack([
+        y_mag,
+        frames_yuv[t][:,:,1],
+        frames_yuv[t][:,:,2]
+    ], axis=2)
+
+    out = cv2.cvtColor(
+        (yuv_mag * 255).astype(np.uint8),
+        cv2.COLOR_YUV2BGR
+    )
+
+    out_frames.append(out)
+
+print("Saving video...")
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (scaled_w, scaled_h))
+
+for f in out_frames:
+    writer.write(f)
+
+writer.release()
+
+print("DONE.")
+print("Saved to:", OUTPUT_VIDEO)

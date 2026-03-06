@@ -1,0 +1,21 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+
+# Environment variables
+.env
