@@ -2,11 +2,6 @@
 .venv/
 venv/
 
-# Model weights
-*.pth
-*.pt
-*.ckpt
-
 # Python cache
 __pycache__/
 *.pyc
